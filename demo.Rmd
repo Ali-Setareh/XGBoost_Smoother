@@ -1,0 +1,214 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(hdm)
+library(grf)
+library(xgboost)
+source("xgboost_smoother.R")
+
+Y = pension$net_tfa
+# Treatment
+D = pension$p401
+# Create main effects matrix
+X = model.matrix(~ 0 + age + db + educ + fsize + hown + inc + male + marr + pira + twoearn, data = pension)
+```
+
+```{r}
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X), label = Y)
+#dtest = xgb.DMatrix(data = as.matrix(test_features), label = test_targets)
+
+# Define model parameters
+params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.85, # Equivalent to learning_rate
+  max_depth = 6, # Need to specify a value as XGBoost requires a numerical value
+  min_child_weight = 1, # Not a direct equivalent but serves to control over-fitting
+  subsample = 1,
+  colsample_bytree = 1, # Equivalent to 'sqrt' in max_features
+  # Note: XGBoost does not have a direct equivalent for 'max_leaf_nodes' and 'init'
+  lambda = 1,
+  base_score = 0.0
+)
+
+# Number of boosting rounds (equivalent to n_estimators)
+nrounds = 10
+
+# Train the model
+model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
+```
+
+```{r}
+leaf_indices_train = predict(model, dtrain, predleaf = TRUE)
+smoother_train = create_S_from_gbtregressor(model,leaf_indices_train,output_dir,save_output = FALSE)
+```
+```{r}
+# plot the first tree
+xgb.plot.tree(model = model, trees = 1,plot_width = 1000, 
+                           plot_height = 1000)
+```
+
+
+```{r}
+xgb_pred = predict(model, dtrain)
+smoother_pred = smoother_train%*% Y
+plot(xgb_pred, smoother_pred)
+
+
+# Show that the (out-of-bag- predictions in this case) are numerically equivalent to the smoother created predictions.
+#points(predict(rfY)$predictions,SY %*% Y, col = "blue")
+
+abline(a = 0, b = 1, col = "red")
+```
+# compare with random forest
+```{r}
+# Outcome random forest
+rfY = regression_forest(X,Y)
+# Extract Smoother matrix
+SY = get_forest_weights(rfY)
+
+forest_pred = predict(rfY)$predictions
+smoother_pred_for = SY %*% Y
+```
+
+```{r}
+plot(forest_pred,smoother_pred_for)
+```
+```{r}
+S_metrics_train = compute_metrics_from_S(smoother_train,Y)
+
+
+names(S_metrics_train) = c("MSE", "Accuracy", "Effective Trace", "L2 Norm", "Squared L2 Norm")
+
+# Print the results in a table format
+print(S_metrics_train)
+```
+```{r}
+metrics_train = compute_metrics_from_xgboost(model,dtrain,Y)
+names(metrics_train) = c("MSE", "Accuracy")
+
+# Print the results in a table format
+print(metrics_train)
+```
+
+# Prediction_reconstruction 
+
+We can reconstruct the predictions iteratively with reconstruct_predictions function from xgboost_smoother: 
+
+
+```{r}
+predict(model, dtrain) - reconstruct_predictions(model,dtrain)
+```
+As it is seen, the predictions are all most equal up to the numerical errors. 
+
+# XGBoost loss function
+
+To make sure that the internal mean squared loss function of XGBoost is in fact $\frac{1}{2}(y-y_{pred})^2$, we use the capability of XGBOost for defining custom loss functions. So we define our loss function as $\frac{1}{2}(y-y_{pred})^2$ with gradiant and hessian as given below and then compare the predictions using our custom loss with internal XGBoost loss
+
+```{r}
+# Custom objective function for regression
+custom_loss = function(preds, dtrain) {
+  labels = getinfo(dtrain, "label")
+  residuals = (preds - labels)
+  grad = residuals  # Gradient
+  hess = rep(1, length(residuals))  # Hessian
+  return(list(grad = grad, hess = hess))
+}
+```
+
+```{r}
+
+params_custom <- list(
+  booster = "gbtree",
+  objective = custom_loss,
+  eta = 0.85, # Equivalent to learning_rate
+  max_depth = 6, # Need to specify a value as XGBoost requires a numerical value
+  min_child_weight = 1, # Not a direct equivalent but serves to control over-fitting
+  subsample = 1,
+  colsample_bytree = 1, # Equivalent to 'sqrt' in max_features
+  # Note: XGBoost does not have a direct equivalent for 'max_leaf_nodes' and 'init'
+  lambda = 1,
+  base_score = 0.0
+)
+model_custom = xgb.train(params_custom, dtrain, nrounds = nrounds)
+```
+
+```{r}
+xgb_pred = predict(model, dtrain)
+xgb_pred_custom = predict(model_custom, dtrain)
+
+plot(xgb_pred, xgb_pred_custom)
+
+
+# Show that the (out-of-bag- predictions in this case) are numerically equivalent to the smoother created predictions.
+#points(predict(rfY)$predictions,SY %*% Y, col = "blue")
+
+abline(a = 0, b = 1, col = "red")
+```
+As we see, the predictions resulted from two loss functions match up. 
+
+# Testing the compact version 
+```{r}
+library(hdm)
+library(grf)
+library(xgboost)
+source("xgboost_smoother.R")
+
+Y = pension$net_tfa[1:1000]
+# Treatment
+D = pension$p401[1:1000]
+# Create main effects matrix
+X = model.matrix(~ 0 + age + db + educ + fsize + hown + inc + male + marr + pira + twoearn, data = pension[1:1000,])
+```
+
+```{r}
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X), label = Y)
+#dtest = xgb.DMatrix(data = as.matrix(test_features), label = test_targets)
+
+# Define model parameters
+params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.85, # Equivalent to learning_rate
+  max_depth = 6, # Need to specify a value as XGBoost requires a numerical value
+  min_child_weight = 1, # Not a direct equivalent but serves to control over-fitting
+  subsample = 1,
+  colsample_bytree = 1, # Equivalent to 'sqrt' in max_features
+  # Note: XGBoost does not have a direct equivalent for 'max_leaf_nodes' and 'init'
+  lambda = 1,
+  base_score = 0.0
+)
+
+# Number of boosting rounds (equivalent to n_estimators)
+nrounds = 10
+
+# Train the model
+model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
+```
+
+```{r}
+leaf_indices_train = predict(model, dtrain, predleaf = TRUE)
+smoother_train = create_S_from_gbtregressor(model,leaf_indices_train,output_dir,save_output = FALSE,compact = TRUE)
+```
+
+```{r}
+xgb_pred = predict(model, dtrain)
+smoother_pred = smoother_train%*% Y
+plot(xgb_pred, smoother_pred)
+
+
+# Show that the (out-of-bag- predictions in this case) are numerically equivalent to the smoother created predictions.
+#points(predict(rfY)$predictions,SY %*% Y, col = "blue")
+
+abline(a = 0, b = 1, col = "red")
+```
+
+We see that the compact version works. 
+
+
+
