@@ -1,0 +1,434 @@
+---
+title: "Equivalent Kernel"
+output: html_notebook
+bibliography: references.bib
+---
+
+# Setting up
+
+First, load the necessary libraries:
+
+```{r packages,warning = FALSE, message=FALSE, results = 'hide'}
+library(reticulate) # for R - Python usage
+library(grf) # for the regression forest
+library(np) # for kernel smoothing methods
+library(tidyverse)
+library(foreach) # needed for faster implementation of my own NW-estimator
+library(doParallel) # needed for faster implementation of my own NW-estimator
+library(xgboost)
+source("xgboost_smoother.R")
+```
+
+Do the same for Python, the reticulate package usually runs stuff in a particular environment. In order to be safe and have all necessary packages installed, run this code:
+
+
+```{r, message = FALSE, warning=FALSE}
+virtualenv_create("r-reticulate")
+use_virtualenv("r-reticulate", required = TRUE)
+py_config()
+#use_python("/Users/henripfleiderer/anaconda3/bin/python", required = TRUE)
+virtualenv_install(packages = c("numpy==1.26.4","scipy", "scikit-learn","matplotlib","pandas"))
+py_config()
+```
+
+Now, import the necessary python packages 
+```{python}
+import numpy as np
+
+from sklearn.kernel_ridge import KernelRidge
+
+from sklearn.metrics.pairwise import pairwise_kernels # to manually compute the kernel function
+
+from sklearn.model_selection import GridSearchCV
+
+from scipy import stats
+
+import matplotlib.pyplot as plt
+
+import pandas as pd
+
+from sklearn.gaussian_process.kernels import RBF # matern kernel but for GP 
+
+from sklearn.gaussian_process.kernels import Matern # matern kernel but for GP 
+
+from sklearn.model_selection import RandomizedSearchCV
+
+from scipy.stats import loguniform
+
+from scipy.stats import uniform
+```
+
+# Functions for NW smooting in R:
+
+Gaussian kernel, for two input vectors and one bandwidth, common across all dimensions:
+```{r}
+gaussian_kernel = function(x1,x2,h, order = 2){
+  
+  x1 = matrix(x1,ncol = 1)
+  x2 = matrix(x2,ncol = 1)
+  
+  d = dim(x1)[1]
+  
+  u = sqrt(t(x1-x2)%*%(x1-x2))/h
+  
+  const = (2*pi)^(1/2)
+  
+  if(order==2){
+  k = exp(-u^2/2)/const
+  } else if(order==4){
+    k = (3/2 - 1/2*u^2)*exp(-u^2/2)/const
+  } else if (order==6){
+    k = (15/8 - 5/4*u^2 + 1/8 * u^4)*exp(-u^2/2)/const
+  }
+  
+  return(k)
+}
+```
+
+A function for fitting a NW-estimator. With given bandwidth. Uses parallel computing:
+
+```{r}
+fit_kern_Reg_parallel = function(x_test, x_train, y_train, h,...) {
+  # Use foreach with .export to ensure functions are available in the parallel environment
+  # Use foreach to parallelize the outer loop -> this makes it faster
+  n = length(x_train[, 1])
+  H_mat = foreach(i = seq_along(x_test[, 1]), .combine = "rbind", .packages = c("base"), .export = c("gaussian_kernel")) %dopar% {
+    K_vec = numeric(n)
+    
+    # Inner loop
+    for (j in seq_along(x_train[, 1])) {
+      K_vec[j] = gaussian_kernel(x_test[i, ], x_train[j, ], h,...)
+    }
+    
+    # Return row for H_mat
+    K_vec / sum(K_vec)
+  }
+  
+  fhat = H_mat%*%y_train
+  
+  results = list(
+    predictions = fhat,
+    H = H_mat
+  )
+  return(results)  # Return predictions
+}
+
+```
+
+A function that computes the Generalized Cross-Validation (GCV) objective, also uses parallel computing. As proposed in @racine_introduction_2019:
+
+```{r}
+GCV_kern_smooth_parallel = function(x_train, y_train, h,...) {
+  n = length(x_train[, 1])
+  
+  # Use foreach to parallelize the outer loop -> this makes it faster
+  H_mat = foreach(i = seq_along(x_train[, 1]), .combine = "rbind", .packages = c("base"), .export = c("gaussian_kernel")) %dopar% {
+    K_vec = numeric(n)
+    
+    # Inner loop
+    for (j in seq_along(x_train[, 1])) {
+      K_vec[j] = gaussian_kernel(x_train[i, ], x_train[j, ], h,...)
+    }
+    
+    # Return row for H_mat
+    K_vec / sum(K_vec)
+  }
+  
+  # Compute trace and GCV
+  trace = sum(diag(diag(n) - H_mat))
+  GCV = (trace / n)^(-2) * (1 / n) * sum((y_train - H_mat %*% y_train)^2)
+  
+  return(GCV)
+}
+```
+
+A function that trains the model (optimizes bandwidth) and gives predictions on test points:
+```{r}
+fit_kern_Reg_GCV_parallel = function(x_test,x_train,y_train,h_min=0.1,h_max = 2,...){
+  # x_eval -> a n_test x d-dimensional matrix of points to evaluate the function:
+  # x_train -> training points, x values
+  # y_train -> training points, y values
+  # h_min -> min value for bandwidth
+  # h_max -> max value for bandwidth
+  
+  # set up parallelization:
+  n_cores = detectCores() - 1
+  
+  # Set up parallel cluster
+  cl = makeCluster(n_cores)
+  registerDoParallel(cl)
+  
+  # first, find the optimal bandwidth:
+  
+  result = optimize(function(h) GCV_kern_smooth_parallel(x_train, y_train, h,...), 
+                    interval = c(h_min, h_max), 
+                    tol = 1e-3)
+  
+  # Extract optimal bandwidth
+  optimal_h = result$minimum
+  
+  model_fit = fit_kern_Reg_parallel(x_test,x_train,y_train,optimal_h,...)
+  fhat = model_fit$predictions
+  optimal_H_mat = model_fit$H
+  
+  stopCluster(cl)
+  result = list(
+    predictions = fhat,
+    h_opt = optimal_h,
+    H_opt = optimal_H_mat
+  )
+  
+  return(result)
+}
+
+```
+
+
+# Smooth function
+
+Create a multivariate smooth function to check the curse of dimensionality, for a sin function (nonlinear) with a polynomial inside:
+```{r}
+y_function_smooth = function(x,b){
+  y = sin(x%*%b)  #+ cos(-x%*%b)
+}
+```
+
+Draw and visualize a realization for $p = 1$:
+
+```{r}
+set.seed(123)
+p = 1
+j = 1
+b = rep(1,p)/((1:p)^j)
+X = matrix(seq(-5,5,0.01),ncol = 1)
+y = y_function_smooth(X,b) + rnorm(dim(X)[1],sd = 0.5)
+y_true = y_function_smooth(X,b)
+tibble(X,y) %>% 
+  ggplot(aes(x = X, y = y)) +
+  geom_point(alpha = 0.2)+
+  geom_line(aes(x = X, y = y_true), color = "black")+
+  theme_minimal()
+```
+### KRR
+
+
+##### Gaussian
+Use KRR to find a prediction:
+
+Grid for hyperparameter search:
+```{python}
+param_distributions_Gaussian = {
+  "alpha": uniform(1e-9, 1),
+  "kernel__length_scale": uniform(1e-9, 8),
+}
+
+KRR_CV_Gaussian = RandomizedSearchCV(
+    KernelRidge(kernel = RBF()),
+    param_distributions=param_distributions_Gaussian,
+    n_iter=500,
+    n_jobs=-1
+    )
+```
+
+
+
+Fit:
+
+```{python}
+_ = KRR_CV_Gaussian.fit(r.X,r.y) # fit the kernel ridge regression using cross.validated lambda
+y_hat_CV = KRR_CV_Gaussian.predict(r.X) # predict the test observations
+```
+
+
+Plot true function, prediction and observations:
+```{r}
+y_hat_KRR = as.numeric(py$y_hat_CV)
+tibble(values = c(y_true, y_hat_KRR),
+       x = rep(X,2),
+       Method = factor(c(rep("True Function", length(y_true)),rep("KRR", length(y_hat_KRR)) ))) %>% 
+  ggplot(aes(x = x, y = values, color = Method)) +
+  geom_point(aes(x = rep(X,2), y = rep(y,2)), alpha = 0.2, color = "black")+
+  scale_color_manual(values = c("True Function" = "black", "KRR" = "red")) +
+  geom_line()+
+  labs(x = "x", y = "y")+
+  theme_minimal()
+```
+
+```{python}
+K = RBF(length_scale = KRR_CV_Gaussian.best_params_['kernel__length_scale'],length_scale_bounds = "fixed")
+K_mat = K(r.X)
+inv = np.linalg.inv(K_mat + KRR_CV_Gaussian.best_params_['alpha']*np.eye(K_mat.shape[0])) 
+weight_matrix_Gaussian = K_mat@ inv # weight matrix
+```
+
+```{python}
+np.shape(K_mat)
+np.shape(r.X)
+np.shape(weight_matrix_Gaussian)
+```
+
+
+```{r}
+#which(X==0)
+weights_at_zero_KRR = py$weight_matrix_Gaussian[which(X==0),]
+tibble(X,weights_at_zero_KRR) %>% 
+  ggplot(aes(x = X, y = weights_at_zero_KRR)) +
+  geom_line(color = "red")
+```
+
+
+
+
+### Regression Forest
+Compare to Regression Forest:
+
+```{r}
+reg_forest = regression_forest(X,y, tune.parameters = "all")
+y_hat_rf = predict(reg_forest, X)$predictions
+
+tibble(value = c(y_true,y_hat_KRR,y_hat_rf),
+       X_grid = rep(X,3),
+       Method = factor(c(rep("True Function", dim(X)[1]),rep("KRR", dim(X)[1]), rep("Random Forest", dim(X)[1])))) %>% 
+  ggplot(aes(x = rep(X,3), y = rep(y,3))) +
+  geom_point(alpha = 0.1)+
+  geom_line(aes(x = X_grid, y = value, color = Method))+
+  scale_color_manual(values = c("True Function" = "black", "KRR" = "red", "Random Forest" = "green")) +
+  theme_minimal()
+```
+
+Get the weights:
+
+```{r}
+weights_at_zero_RF = matrix(get_forest_weights(reg_forest,as.matrix(0)),ncol = 1)
+```
+
+```{r}
+tibble(weights = c(weights_at_zero_KRR,as.numeric(weights_at_zero_RF)),
+        X = rep(X,2),
+       Method = factor(c(rep("KRR", length(weights_at_zero_KRR)),rep("Random Forest", length(weights_at_zero_KRR))))) %>% 
+  ggplot(aes(x = X, y = weights, color = Method)) +
+  geom_line()+
+  scale_color_manual(values = c("KRR" = "red", "Random Forest" = "green")) +
+  theme_minimal()
+```
+
+### Nadayara-Watson
+
+##### Order 2
+
+Now, additionally use NW:
+
+```{r}
+fit_model = fit_kern_Reg_GCV_parallel(X,X,y,0.01,1)
+y_hat_np = fit_model$predictions
+
+tibble(value = c(y_true,y_hat_KRR,y_hat_rf,y_hat_np),
+       X_grid = rep(X,4),
+       Method = factor(c(rep("True Function", dim(X)[1]),rep("KRR", dim(X)[1]), rep("Random Forest", dim(X)[1]), rep("NW", dim(X)[1])    ))) %>% 
+  ggplot(aes(x = rep(X,4), y = rep(y,4))) +
+  geom_point(alpha = 0.07)+
+  geom_line(aes(x = X_grid, y = value, color = Method))+
+  scale_color_manual(values = c("True Function" = "black", "KRR" = "red", "Random Forest" = "green", "NW" = "purple")) +
+  theme_minimal()
+```
+
+Extract weights applied
+```{r}
+weights_at_zero_np = fit_model$H_opt[which(X==0),]
+```
+
+Plot "equivalent kernels"
+
+```{r}
+tibble(weights = c(weights_at_zero_KRR,as.numeric(weights_at_zero_RF),weights_at_zero_np),
+        X = rep(X,3),
+       Method = factor(c(rep("KRR", length(weights_at_zero_KRR)),rep("Random Forest", length(weights_at_zero_KRR)),rep("NW", length(weights_at_zero_KRR))))) %>% 
+  ggplot(aes(x = X, y = weights, color = Method)) +
+  geom_line()+
+  scale_color_manual(values = c("KRR" = "red", "Random Forest" = "green", "NW" = "purple")) +
+  theme_minimal()
+```
+
+### XG Boost
+
+Set up:
+
+```{r}
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X), label = y)
+#dtest = xgb.DMatrix(data = as.matrix(test_features), label = test_targets)
+
+# Define model parameters
+params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.85, # Equivalent to learning_rate
+  max_depth = 6, # Need to specify a value as XGBoost requires a numerical value
+  min_child_weight = 100, # Not a direct equivalent but serves to control over-fitting
+  subsample = 1,
+  colsample_bytree = 1, # Equivalent to 'sqrt' in max_features
+  # Note: XGBoost does not have a direct equivalent for 'max_leaf_nodes' and 'init'
+  lambda = 100
+)
+
+# Number of boosting rounds (equivalent to n_estimators)
+nrounds = 50
+
+# Train the model
+model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
+```
+
+Get predictions and smoother matrix:
+
+```{r, results = 'hide', message = FALSE}
+leaf_indices_train = predict(model, dtrain, predleaf = TRUE)
+smoother_train_XG = create_S_from_gbtregressor(model,leaf_indices_train,output_dir,save_output = FALSE)
+```
+
+Plot the prediction:
+
+```{r}
+y_hat_xg=predict(model, dtrain)
+
+tibble(value = c(y_true,y_hat_KRR,y_hat_rf,y_hat_np,y_hat_xg),
+       X_grid = rep(X,5),
+       Method = factor(c(rep("True Function", dim(X)[1]),rep("KRR", dim(X)[1]), rep("Random Forest", dim(X)[1]), rep("NW", dim(X)[1]) , rep("XGBoost", dim(X)[1])    ))) %>% 
+  ggplot(aes(x = rep(X,5), y = rep(y,5))) +
+  geom_point(alpha = 0.03)+
+  geom_line(aes(x = X_grid, y = value, color = Method))+
+  scale_color_manual(values = c("True Function" = "black", "KRR" = "red", "Random Forest" = "green", "NW" = "purple", "XGBoost" = "orange")) +
+  theme_minimal()
+```
+
+Extract weights applied
+```{r}
+weights_at_zero_XG = smoother_train_XG[which(X==0),]
+```
+
+Plot "equivalent kernels"
+
+```{r}
+tibble(weights = c(weights_at_zero_KRR,as.numeric(weights_at_zero_RF),weights_at_zero_np, weights_at_zero_XG),
+        X = rep(X,4),
+       Method = factor(c(rep("KRR", length(weights_at_zero_KRR)),rep("Random Forest", length(weights_at_zero_KRR)),rep("NW", length(weights_at_zero_KRR)),rep("XGBoost", length(weights_at_zero_KRR))))) %>% 
+  ggplot(aes(x = X, y = weights, color = Method)) +
+  geom_line()+
+  scale_color_manual(values = c("KRR" = "red", "Random Forest" = "green", "NW" = "purple", "XGBoost" = "orange")) +
+  theme_minimal()
+```
+Sum the weights:
+
+```{r}
+sum(weights_at_zero_KRR)
+sum(as.numeric(weights_at_zero_RF))
+sum(weights_at_zero_np)
+sum(weights_at_zero_XG)
+```
+
+
+# References
+
+<div id="refs"></div>
+
+
+

@@ -1,0 +1,358 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(xgboost)
+library(tidyverse)
+source("xgboost_smoother.R")
+
+```
+
+```{r}
+y_function_smooth = function(x,b){
+  y = sin(x%*%b)  #+ cos(-x%*%b)
+}
+```
+
+```{r}
+set.seed(123)
+p = 1
+j = 1
+b = rep(1,p)/((1:p)^j)
+X = matrix(seq(-5,5,0.01),ncol = 1)
+Y = y_function_smooth(X,b) + rnorm(dim(X)[1],sd = 0.5)
+y_true = y_function_smooth(X,b)
+data <- tibble(X = as.numeric(X), Y = as.numeric(Y), y_true = as.numeric(y_true))
+
+ggplot(data, aes(x = X, y = Y)) +
+  geom_point(alpha = 0.2) +
+  geom_line(aes(y = y_true), color = "red") +
+  theme_minimal()
+```
+
+
+
+```{r}
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X), label = Y)
+#dtest = xgb.DMatrix(data = as.matrix(test_features), label = test_targets)
+
+# Define model parameters
+params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.3, # Equivalent to learning_rate
+  max_depth = 6, # Need to specify a value as XGBoost requires a numerical value
+  min_child_weight = 80, # Not a direct equivalent but serves to control over-fitting
+  subsample = 1,
+  colsample_bytree = 1, # Equivalent to 'sqrt' in max_features
+  # Note: XGBoost does not have a direct equivalent for 'max_leaf_nodes' and 'init'
+  lambda = 10,
+  base_score = 0.0
+)
+
+# Number of boosting rounds (equivalent to n_estimators)
+nrounds = 200
+
+# Train the model
+model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
+```
+
+
+```{r, results = 'hide', message = FALSE}
+leaf_indices_train = predict(model, dtrain, predleaf = TRUE)
+output_dir = "H:/My Drive/Job/CausalInference/XGBoost_Smoother/weight_tracking"
+smoother_train_XG = create_S_from_gbtregressor(model,leaf_indices_train,output_dir,save_output = TRUE)
+```
+```{r}
+y_hat_xg=predict(model, dtrain)
+
+data <- tibble(
+  value = c(y_true, y_hat_xg, Y),
+  X_grid = rep(X, 3),
+  Method = factor(c(rep("True Function", length(X)), rep("XGBoost", length(X)), rep("Observed", length(X))))
+)
+
+# Plotting
+ggplot(data, aes(x = X_grid, y = value, color = Method)) +
+  geom_point(data = data %>% filter(Method == "Observed"), alpha = 0.4, color = "gray") + # Plot observed points
+  geom_line(data = data %>% filter(Method != "Observed")) + # Plot lines for true function and XGBoost
+  scale_color_manual(values = c("True Function" = "black", "XGBoost" = "orange")) +
+  theme_minimal() +
+  labs(x = "X", y = "Value", color = "Method")
+```
+```{r}
+weights_at_zero_XG = smoother_train_XG[which(X==0),]
+```
+
+```{r fig.width=5, fig.height=4}
+# Create a tibble with the X and Y values
+data <- tibble(X = X, Y = weights_at_zero_XG)
+
+# Plotting
+ggplot(data, aes(x = X, y = weights_at_zero_XG)) +
+  geom_line(color = "blue") +  # Plot the line
+  theme_minimal() +
+  labs(x = "X", y = "Y", color = "Method")
+```
+
+
+
+```{r}
+install.packages("heatmaply")
+
+```
+
+
+
+```{r}
+library(shiny)
+library(plotly)
+library(tibble)
+library(ggplot2)
+library(dplyr)
+library(magrittr)  
+
+# Define the path to the RDS files
+
+output_dir = "H:/My Drive/Job/CausalInference/XGBoost_Smoother/weight_tracking"
+# List of RDS files in the specified directory
+rds_files = list.files(path = output_dir, pattern = "*.rds", full.names = TRUE)
+
+
+# Extract indices from filenames and sort files by index
+extract_index = function(file) {
+  as.numeric(gsub(".*_([0-9]+)\\.rds$", "\\1", file))
+}
+indices = sapply(rds_files, extract_index)
+sorted_files = rds_files[order(indices)]
+
+# Define UI for the Shiny app
+ui = fluidPage(
+  titlePanel("Weight Tracking for XGBoost"),
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("num_curves",
+                  "Boosting Round",
+                  min = 1, 
+                  max = length(sorted_files), 
+                  value = 1,
+                  step = 1)
+    ),
+    mainPanel(
+      plotlyOutput("plot", height = "400px"),  # Original plot on the top
+      fluidRow(
+        column(6, plotOutput("plot2", height = "400px")),  # Comparison plot on the bottom-left
+        column(6, plotOutput("plot3", height = "400px"))   # Residuals plot on the bottom-right
+      )
+    )
+  )
+)
+
+# Define server logic
+server = function(input, output) {
+  output$plot = renderPlotly({
+    smoother_train_XG = readRDS(sorted_files[input$num_curves])
+    weights_at_zero_XG = smoother_train_XG[which(X == 0), ]
+    data = tibble(X = X, Y = weights_at_zero_XG)
+    plot_ly(data, x = ~X, y = ~Y, type = 'scatter', mode = 'lines', name = basename(sorted_files[input$num_curves]))%>%
+      layout(yaxis = list(title = "weight"))
+  })
+  
+  output$plot2 = renderPlot({
+    smoother_train_XG = readRDS(sorted_files[input$num_curves])
+    
+    # Calculate y_hat_xg
+    y_hat_xg = as.vector(smoother_train_XG %*% Y)
+    
+    # Create the data tibble
+    data = tibble(
+      value = c(y_true, y_hat_xg, Y),
+      X_grid = rep(X, 3),
+      Method = factor(c(rep("True Function", length(X)), rep("XGBoost", length(X)), rep("Observed", length(X))))
+    )
+    
+    # Plot using ggplot2
+    ggplot(data, aes(x = X_grid, y = value, color = Method)) +
+      geom_point(data = dplyr::filter(data, Method == "Observed"), alpha = 0.4, color = "gray") +
+      geom_line(data = dplyr::filter(data, Method != "Observed")) +
+      scale_color_manual(values = c("True Function" = "black", "XGBoost" = "orange")) +
+      theme_minimal() +
+      labs(x = "X", y = "Label", color = "Method")
+  })
+
+  output$plot3 = renderPlot({
+    # Initialize an empty data frame to accumulate residuals
+    residual_data = tibble(Index = numeric(), Residuals = numeric())
+
+    # Loop over all files up to the current index
+    for (i in 1:input$num_curves) {
+      smoother_train_XG = readRDS(sorted_files[i])
+      
+      # Calculate y_hat_xg
+      y_hat_xg = as.vector(smoother_train_XG %*% Y)
+      
+      # Calculate residuals for X == 0
+      residuals_at_zero_XG = Y[which(X == 0)] - y_hat_xg[which(X == 0)]
+      
+      # Add the residuals to the cumulative data frame
+      residual_data = rbind(residual_data, tibble(
+        Index = i,
+        Residuals = residuals_at_zero_XG
+      ))
+    }
+    
+    # Plot the accumulated residuals versus index
+    ggplot(residual_data, aes(x = Index, y = Residuals)) +
+      geom_line(color = "red") +
+      geom_point(color = "blue") +
+      theme_minimal() +
+      labs(x = "Index", y = "Residuals (Y - y_hat_xg)", title = "Residuals vs. Index for X == 0")
+  })
+  
+  output$heatmap = renderPlotly({
+    smoother_train_XG = readRDS(sorted_files[input$num_curves])
+    
+    # Generate heatmap using heatmaply
+    heatmaply(
+      smoother_train_XG,
+      xlab = "X",
+      ylab = "Index",
+      scale_fill_gradient_fun = ggplot2::scale_fill_viridis_c,
+      main = "Heatmap of Weights for All X",
+      colors = viridis::viridis(256)
+    )
+  })
+}
+
+# Run the application 
+shinyApp(ui = ui, server = server)
+
+```
+
+```{r}
+library(shiny)
+library(plotly)
+library(tibble)
+library(ggplot2)
+library(dplyr)
+library(heatmaply)
+
+output_dir = "H:/My Drive/Job/CausalInference/XGBoost_Smoother/weight_tracking"
+# List of RDS files in the specified directory
+rds_files = list.files(path = output_dir, pattern = "*.rds", full.names = TRUE)
+
+
+# Extract indices from filenames and sort files by index
+extract_index = function(file) {
+  as.numeric(gsub(".*_([0-9]+)\\.rds$", "\\1", file))
+}
+indices = sapply(rds_files, extract_index)
+sorted_files = rds_files[order(indices)]
+
+# Define UI for the Shiny app
+ui = fluidPage(
+  titlePanel("Weight Tracking for XGBoost"),
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("num_curves", 
+                  "Boosting Round", 
+                  min = 1, 
+                  max = length(sorted_files), 
+                  value = 1,
+                  step = 1)
+    ),
+    mainPanel(
+      plotlyOutput("plot", height = "300px"),  # Original plot on the top
+      fluidRow(
+        column(6, plotOutput("plot2", height = "300px")),  # Comparison plot on the bottom-left
+        column(6, plotOutput("plot3", height = "300px"))   # Residuals plot on the bottom-right
+      ),
+      plotlyOutput("heatmap", height = "400px")  # Heatmap plot below spanning full width
+    )
+  )
+)
+
+# Define server logic
+server = function(input, output) {
+  output$plot = renderPlotly({
+    smoother_train_XG = readRDS(sorted_files[input$num_curves])
+    weights_at_zero_XG = smoother_train_XG[which(X == 0), ]
+    data = tibble(X = X, Y = weights_at_zero_XG)
+    plot_ly(data, x = ~X, y = ~Y, type = 'scatter', mode = 'lines', name = basename(sorted_files[input$num_curves])) %>%
+      layout(yaxis = list(title = "weight"))
+  })
+  
+  output$plot2 = renderPlot({
+    smoother_train_XG = readRDS(sorted_files[input$num_curves])
+    
+    # Calculate y_hat_xg
+    y_hat_xg = as.vector(smoother_train_XG %*% Y)
+    
+    # Create the data tibble
+    data = tibble(
+      value = c(y_true, y_hat_xg, Y),
+      X_grid = rep(X, 3),
+      Method = factor(c(rep("True Function", length(X)), rep("XGBoost", length(X)), rep("Observed", length(X))))
+    )
+    
+    # Plot using ggplot2
+    ggplot(data, aes(x = X_grid, y = value, color = Method)) +
+      geom_point(data = dplyr::filter(data, Method == "Observed"), alpha = 0.4, color = "gray") +
+      geom_line(data = dplyr::filter(data, Method != "Observed")) +
+      scale_color_manual(values = c("True Function" = "black", "XGBoost" = "orange")) +
+      theme_minimal() +
+      labs(x = "X", y = "Value", color = "Method")
+  })
+
+  output$plot3 = renderPlot({
+    # Initialize an empty data frame to accumulate residuals
+    residual_data = tibble(Index = numeric(), Residuals = numeric())
+
+    # Loop over all files up to the current index
+    for (i in 1:input$num_curves) {
+      smoother_train_XG = readRDS(sorted_files[i])
+      
+      # Calculate y_hat_xg
+      y_hat_xg = as.vector(smoother_train_XG %*% Y)
+      
+      # Calculate residuals for X == 0
+      residuals_at_zero_XG = Y[which(X == 0)] - y_hat_xg[which(X == 0)]
+      
+      # Add the residuals to the cumulative data frame
+      residual_data = rbind(residual_data, tibble(
+        Index = i,
+        Residuals = residuals_at_zero_XG
+      ))
+    }
+    
+    # Plot the accumulated residuals versus index
+    ggplot(residual_data, aes(x = Index, y = Residuals)) +
+      geom_line(color = "red") +
+      geom_point(color = "blue") +
+      theme_minimal() +
+      labs(x = "Index", y = "Residuals (Y - y_hat_xg)", title = "Residuals vs. Index for X == 0")
+  })
+
+  output$heatmap = renderPlotly({
+    smoother_train_XG = readRDS(sorted_files[input$num_curves])
+    
+    # Generate heatmap using heatmaply
+    heatmaply(
+      smoother_train_XG,
+      xlab = "X",
+      ylab = "Index",
+      scale_fill_gradient_fun = ggplot2::scale_fill_viridis_c,
+      main = "Heatmap of Weights for All X",
+      colors = viridis::viridis(256)
+    )
+  })
+}
+
+# Run the application 
+shinyApp(ui = ui, server = server)
+
+```
+

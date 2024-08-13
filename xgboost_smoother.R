@@ -76,6 +76,13 @@ create_S_from_single_boosted_tree_compact = function(tree_indices,S_gb_prev,num_
 create_S_from_gbtregressor = function(model,leaf_indices,output_dir = NULL, save_output = FALSE, compact = FALSE){
   
   if (compact==FALSE){
+    
+    if (save_output){
+      # Check if the directory exists, and create it if it doesn't
+      if (!file.exists(output_dir)) {
+        dir.create(output_dir, recursive = TRUE)
+      }
+    }
   n = nrow(leaf_indices)
   lambda = model$params$lambda
   S_curr = matrix(0, nrow = n, ncol = n)
@@ -101,6 +108,13 @@ create_S_from_gbtregressor = function(model,leaf_indices,output_dir = NULL, save
   
   else if (compact==TRUE){
     
+    if (save_output){
+      # Check if the directory exists, and create it if it doesn't
+      if (!file.exists(output_dir)) {
+        dir.create(output_dir, recursive = TRUE)
+      }
+    }
+    
     n = nrow(leaf_indices)
     lambda = model$params$lambda
     S_curr = matrix(0, nrow = n, ncol = n)
@@ -114,9 +128,14 @@ create_S_from_gbtregressor = function(model,leaf_indices,output_dir = NULL, save
       S = create_S_from_single_boosted_tree_compact(current_tree,if(col == 1) NULL else S_curr ,n, lambda)
       S_curr = S_curr + lr * S
       
+      
+      
       if (save_output) {
         # Save the current matrix to an RDS file
         output_filename = paste(output_dir, "/S_curr_iteration_", col, ".rds", sep = "")
+        
+        
+        
         saveRDS(S_curr, file = output_filename)
       }
     }
