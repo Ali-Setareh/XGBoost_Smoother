@@ -8,7 +8,7 @@ output:
 ```{r}
 library(xgboost)
 library(tidyverse)
-source("xgboost_smoother.R")
+source("xgboost_smoother_2.R")
 
 ```
 
@@ -28,25 +28,35 @@ Y = y_function_smooth(X,b) + rnorm(dim(X)[1],sd = 0.5)
 y_true = y_function_smooth(X,b)
 data <- tibble(X = as.numeric(X), Y = as.numeric(Y), y_true = as.numeric(y_true))
 
-ggplot(data, aes(x = X, y = Y)) +
+# Create a train-test split
+train_indices <- sample(1:nrow(data), size = 0.7 * nrow(data))  # 70% for training
+train_data <- data[train_indices, ]
+test_data <- data[-train_indices, ]
+
+# Plot training data with true function line
+ggplot(train_data, aes(x = X, y = Y)) +
   geom_point(alpha = 0.2) +
   geom_line(aes(y = y_true), color = "red") +
   theme_minimal()
+```
+
+```{r}
+train_data
 ```
 
 
 
 ```{r}
 # Convert to DMatrix object
-dtrain = xgb.DMatrix(data = as.matrix(X), label = Y)
-#dtest = xgb.DMatrix(data = as.matrix(test_features), label = test_targets)
+dtrain = xgb.DMatrix(data = as.matrix(train_data$X), label = train_data$Y)
+dtest = xgb.DMatrix(data = as.matrix(test_data$X), label = test _data$Y)
 
 # Define model parameters
 params = list(
   booster = "gbtree",
   objective = "reg:squarederror",
-  eta = 0.3, # Equivalent to learning_rate
-  max_depth = 6, # Need to specify a value as XGBoost requires a numerical value
+  eta = 0.1, # Equivalent to learning_rate
+  max_depth = 1, # Need to specify a value as XGBoost requires a numerical value
   min_child_weight = 80, # Not a direct equivalent but serves to control over-fitting
   subsample = 1,
   colsample_bytree = 1, # Equivalent to 'sqrt' in max_features
@@ -56,7 +66,7 @@ params = list(
 )
 
 # Number of boosting rounds (equivalent to n_estimators)
-nrounds = 200
+nrounds = 1000
 
 # Train the model
 model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
@@ -65,21 +75,29 @@ model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
 
 ```{r, results = 'hide', message = FALSE}
 leaf_indices_train = predict(model, dtrain, predleaf = TRUE)
-current_dir <- getwd()
-output_dir <- file.path(current_dir, "weight_tracking")
+current_dir = getwd()
+output_dir = file.path(current_dir, "weight_tracking")
 
 if (!dir.exists(output_dir)) {
   dir.create(output_dir, recursive = TRUE)
 }
-smoother_train_XG = create_S_from_gbtregressor(model,leaf_indices_train,output_dir,save_output = TRUE)
+smoother_train_XG = create_S_from_gbtregressor(model,leaf_indices_train,output_dir,save_output = FALSE)
 ```
+```{r}
+smoothers = get_xgboost_weights(model,dtrain,)
+```
+
+```{r}
+smoothers = get_xgboost_weights(model,dtrain,dtest)
+```
+
 ```{r}
 y_hat_xg=predict(model, dtrain)
 
 data <- tibble(
-  value = c(y_true, y_hat_xg, Y),
-  X_grid = rep(X, 3),
-  Method = factor(c(rep("True Function", length(X)), rep("XGBoost", length(X)), rep("Observed", length(X))))
+  value = c(y_true[train_indices], y_hat_xg, Y[train_indices]),
+  X_grid = rep(X[train_indices], 3),
+  Method = factor(c(rep("True Function", length(X[train_indices])), rep("XGBoost", length(X[train_indices])), rep("Observed", length(X[train_indices]))))
 )
 
 # Plotting
@@ -91,12 +109,18 @@ ggplot(data, aes(x = X_grid, y = value, color = Method)) +
   labs(x = "X", y = "Value", color = "Method")
 ```
 ```{r}
-weights_at_zero_XG = smoother_train_XG[which(X==0),]
+#weights_at_zero_XG = smoother_train_XG[which(X==0),]
+weights_at_zero_XG = smoothers$S_train[which(X[train_indices]==0),]
+
+```
+
+```{r}
+length(weights_at_zero_XG)
 ```
 
 ```{r fig.width=4, fig.height=2}
 # Create a tibble with the X and Y values
-data <- tibble(X = X, Y = weights_at_zero_XG)
+data <- tibble(X = X[train_indices], Y = weights_at_zero_XG)
 
 # Plotting
 ggplot(data, aes(x = X, y = weights_at_zero_XG)) +
@@ -114,8 +138,8 @@ library(magrittr)
 
 # Define the path to the RDS files
 
-current_dir <- getwd()
-output_dir <- file.path(current_dir, "weight_tracking")
+current_dir = getwd()
+output_dir = file.path(current_dir, "weight_tracking")
 # List of RDS files in the specified directory
 rds_files = list.files(path = output_dir, pattern = "*.rds", full.names = TRUE)
 
@@ -209,29 +233,12 @@ server = function(input, output) {
       theme_minimal() +
       labs(x = "Index", y = "Residuals (Y - y_hat_xg)", title = "Residuals vs. Index for X == 0")
   })
-  
-  output$heatmap = renderPlotly({
-    smoother_train_XG = readRDS(sorted_files[input$num_curves])
-    
-    # Generate heatmap using heatmaply
-    heatmaply(
-      smoother_train_XG,
-      xlab = "X",
-      ylab = "Index",
-      scale_fill_gradient_fun = ggplot2::scale_fill_viridis_c,
-      main = "Heatmap of Weights for All X",
-      colors = viridis::viridis(256)
-    )
-  })
 }
 
 # Run the application 
 shinyApp(ui = ui, server = server)
 
 ```
-
-
-
 
 
 

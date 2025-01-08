@@ -1,0 +1,227 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(mlr3verse)
+library(xgboost)
+library(glue)
+source("xgboost_smoother_2.R")
+```
+
+```{r}
+y_function_smooth = function(x,b){
+  y = sin(x%*%b)  #+ cos(-x%*%b)
+}
+```
+
+```{r}
+set.seed(123)
+p = 1
+j = 1
+b = rep(1,p)/((1:p)^j)
+X = matrix(seq(-5,5,0.01),ncol = 1)
+Y = y_function_smooth(X,b) + rnorm(dim(X)[1],sd = 0.5)
+y_true = y_function_smooth(X,b)
+data <- tibble(X = as.numeric(X), Y = as.numeric(Y), y_true = as.numeric(y_true))
+
+ggplot(data, aes(x = X, y = Y)) +
+  geom_point(alpha = 0.2) +
+  geom_line(aes(y = y_true), color = "red") +
+  theme_minimal()
+```
+```{r}
+df = data.frame(X = X, Y = Y)
+tsk_demo = as_task_regr(df, target = "Y", id = "demo")
+```
+
+```{r}
+# eta: Default: 0.3
+# gamma: Default: 0
+# max_depth: Default: 6
+# min_child_weight: Default: 1
+# subsample: Default: 1
+# colsample_bytree: Default: 1
+# lambda: Default: 1
+# alpha: Default: 0
+# num_parallel_tree: Default: 1
+
+params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.85, # Equivalent to learning_rate
+  max_depth = 6, # Need to specify a value as XGBoost requires a numerical value
+  min_child_weight = 1, # Not a direct equivalent but serves to control over-fitting
+  subsample = 1,
+  colsample_bytree = 1, # Equivalent to 'sqrt' in max_features
+  # Note: XGBoost does not have a direct equivalent for 'max_leaf_nodes' and 'init'
+  lambda = 1,
+  base_score = 0.0
+)
+```
+
+
+
+```{r}
+xgb_learner = lrn("regr.xgboost",
+  nrounds           = to_tune(p_int(10, 100, tags = "budget")),
+  eta               = to_tune(1e-4, 1, logscale = TRUE),
+  max_depth         = to_tune(1, 20),
+  colsample_bytree  = to_tune(1e-1, 1),
+  colsample_bylevel = 0.5, #to_tune(1e-1, 1),
+  lambda            = to_tune(1e-3, 1e3, logscale = TRUE),
+  alpha             = 0,#to_tune(1e-3, 1e3, logscale = TRUE),
+  subsample         = to_tune(1e-1, 1),
+  min_child_weight = to_tune(1,100),
+  base_score = 0.0
+)
+
+#tnr_grid_search = tnr("grid_search", resolution = 5, batch_size = 5)
+tnr_hyperband_search = tnr("hyperband", eta = 2)
+rsmp_cv3 = rsmp("cv", folds = 3)
+msr_ce = msr("regr.mse")
+
+
+at = auto_tuner(
+  tuner = tnr_hyperband_search,
+  learner = xgb_learner,
+  resampling = rsmp_cv3,
+  measure = msr_ce
+)
+
+```
+
+
+
+```{r}
+split = partition(tsk_demo)
+at$train(tsk_demo, row_ids = split$train)
+
+```
+```{r}
+model$params
+```
+
+```{r}
+model = at$learner$model
+# Extract the test data manually from the task
+train_data = as.data.frame(tsk_demo$data(cols = tsk_demo$feature_names))[split$train, ]
+test_data = as.data.frame(tsk_demo$data(cols = tsk_demo$feature_names))[split$test, ]
+Y_train = as.data.frame(tsk_demo$data(cols = tsk_demo$target_names))[split$train, ]
+
+
+# Convert test data to matrix formatt
+train_matrix = as.matrix(train_data)
+test_matrix = as.matrix(test_data)
+
+
+# Create DMatrix for XGBoost
+dtrain = xgboost::xgb.DMatrix(data = train_matrix)
+dtest = xgboost::xgb.DMatrix(data = test_matrix)
+
+glue("train dimensions: {dim(dtrain)[1]} x {dim(dtrain)[2]}")
+glue("test dimensions: {dim(dtest)[1]} x {dim(dtest)[2]}")
+
+#leaf_indices = predict(model, newdata = dtest, predleaf = TRUE)
+  
+# Convert the leaf indices to a data frame 
+#leaf_indices_df = as.data.frame(leaf_indices)
+```
+```{r}
+xgb_learner
+```
+
+```{r}
+#smoother_train_XG = create_S_from_gbtregressor(model,leaf_indices_df)
+```
+```{r}
+source("xgboost_smoother_2.R") 
+
+smoothers = get_xgboost_weights(model,dtrain,dtest)
+
+smoother_train = smoothers$S_train
+smoother_test = smoothers$S_test
+
+
+```
+
+
+
+```{r}
+xgb_pred_train = predict(model, dtrain)
+xgb_pred_test = predict(model, dtest)
+
+smoother_pred_train = smoother_train%*% Y_train
+smoother_pred_test = smoother_test%*% Y_train
+```
+
+```{r}
+plot(xgb_pred_train, smoother_pred_train, col = "blue", pch = 16,
+     main = "Train vs Test Predictions", xlab = "XGB Predictions", ylab = "Smoother Predictions")
+
+
+points(xgb_pred_test, smoother_pred_test, col = "orange", pch = 17)
+
+
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "orange"), pch = c(16, 17))
+
+
+abline(a = 0, b = 1, col = "red", lty = 2) # reference line for equivalence
+```
+
+```{r}
+all.equal(as.numeric(smoother_pred_train),as.numeric(xgb_pred_train))
+```
+
+
+```{r}
+model$params
+```
+
+
+```{r}
+y_hat_xg=predict(model, dtest)
+
+data <- tibble(
+  value = c(y_true[split$test], y_hat_xg, smoother_pred_test,Y[split$test]),
+  X_grid = rep(X[split$test], 4),
+  Method = factor(c(rep("True Function", length(X[split$test])), rep("XGBoost", length(X[split$test])),rep("smoother", length(X[split$test])) ,rep("Observed", length(X[split$test]))))
+)
+
+# Plotting
+ggplot(data, aes(x = X_grid, y = value, color = Method)) +
+  geom_point(data = data %>% filter(Method == "Observed"), alpha = 0.4, color = "gray") + # Plot observed points
+  geom_line(data = data %>% filter(Method != "Observed")) + # Plot lines for true function and XGBoost
+  scale_color_manual(values = c("True Function" = "black", "XGBoost" = "orange", "smoother" = "green")) +
+  theme_minimal() +
+  labs(x = "X", y = "Value", color = "Method")
+```
+
+```{r}
+weights_at_zero_XG = smoother_pred_test[which(X==X[split$test][10]),]
+```
+```{r}
+which(X==X[split$test][10])
+```
+
+```{r}
+smoother_pred_test[which(X==X[split$test][10]),]
+t```
+
+```{r}
+# Create a tibble with the X and Y values
+data <- tibble(X = X[split$test], Y = weights_at_zero_XG)
+
+# Plotting
+ggplot(data, aes(x = X, y = weights_at_zero_XG)) +
+  geom_line(color = "blue") +  # Plot the line
+  theme_minimal() +
+  labs(x = "X", y = "Weight", color = "Method")
+```
+
+```{r}
+at$learner
+```
+

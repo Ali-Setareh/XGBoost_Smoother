@@ -1,0 +1,271 @@
+
+```{r}
+# Load necessary libraries
+library(xgboost)
+library(Matrix)
+library(data.table)
+library(hdm)
+library(grf)
+library(caret)
+library(glue)
+library(tidyverse)
+
+# Set seed for reproducibility
+set.seed(123)
+
+
+# ------------------------------
+# Step 1: Generate Synthetic Data
+# ------------------------------
+
+y_function_smooth <- function(x, b) {
+  y <- sin(x %*% b)  # + cos(-x %*% b)  # Uncomment if you want to include the cosine term
+  return(y)
+}
+
+
+
+set.seed(123)
+p = 5 
+j = 1
+b = rep(1,p)/((1:p)^j)
+
+n = 1000  # Number of training samples
+
+# Generate random data and create the matrix
+X <- matrix(runif(n * p, min = -5, max = 5), nrow = n, ncol = p)
+Y = y_function_smooth(X,b) + rnorm(dim(X)[1],sd = 0.5)
+y_true = y_function_smooth(X,b)
+df = data.frame(X = X, Y = Y)
+
+# Split the data into training and test sets
+train_index = createDataPartition(Y, p = 0.7, list = FALSE)
+
+df_train = df[train_index, ]
+df_test = df[-train_index, ]
+
+
+X_train <- as.matrix(df_train[, 1:p])
+X_test <- as.matrix(df_test[, 1:p])
+
+
+Y_train = as.numeric(df_train$Y)
+Y_test = df_test$Y
+
+n_train = dim(X_train)[1]
+n_test = dim(X_test)[1]
+
+# Create DMatrix objects for XGBoost
+dtrain <- xgb.DMatrix(data = X_train, label = Y_train)
+dtest <- xgb.DMatrix(data = X_test, label = Y_test)
+
+# ------------------------------
+# Step 2: Train XGBoost Model
+# ------------------------------
+
+# Set XGBoost parameters
+params <- list(
+  objective = "reg:squarederror",
+  eta = 1,          # Learning rate set to 1 for simplicity
+  max_depth = 6,    # Small tree depth
+  lambda = 1        # Regularization parameter set to 1 for demonstration
+)
+
+# Number of boosting rounds
+nrounds <- 100
+
+# Train the XGBoost model
+bst <- xgboost(
+  params = params,
+  data = dtrain,
+  nrounds = nrounds,
+  verbose = 0,
+  base_score = 0
+)
+
+# ------------------------------
+# Step 3: Extract Leaf Indices and Leaf Values
+# ------------------------------
+
+# Predict leaf indices for training and test data
+leaf_indices_train <- predict(bst, dtrain, predleaf = TRUE)
+leaf_indices_test <- predict(bst, dtest, predleaf = TRUE)
+# leaf_indices_train and leaf_indices_test are matrices with dimensions:
+# n_train x ntrees and n_test x ntrees respectively
+
+# Convert the model into a data.table for easier manipulation
+model_dt <- xgb.model.dt.tree(model = bst)
+
+# Function to extract leaf values and mappings for each tree
+get_leaf_info <- function(tree_num) {
+  # Filter for the specific tree (tree numbering starts at 0)
+  tree_dt <- model_dt[Tree == (tree_num - 1)]
+  
+  # Extract leaf nodes
+  # Corrected: Use 'Split' instead of 'Leaf' to get leaf values
+  leaf_nodes <- tree_dt[Feature == "Leaf", .(ID, Quality)]
+  
+  # Create a mapping from leaf IDs to leaf values
+  leaf_values <- setNames(as.numeric(leaf_nodes$Quality), leaf_nodes$ID)
+  
+  return(list(leaf_values = leaf_values))
+}
+
+# ------------------------------
+# Step 4: Compute Smoother Matrices for Train and Test
+# ------------------------------
+
+
+# Initialize smoother matrices as sparse matrices
+S_boost_train <- Matrix(0, nrow = n_train, ncol = n_train, sparse = TRUE)
+S_boost_test <- Matrix(0, nrow = n_test, ncol = n_train, sparse = TRUE)
+
+# Learning rate (eta)
+eta <- params$eta
+
+# Loop over each boosting round/tree
+for (t in 1:nrounds) {
+  
+  cat(sprintf("\r Processing tree: %d/%d", t, nrounds))
+  # ------------------------------
+  # Processing Training Data
+  # ------------------------------
+  
+  # Get leaf indices for current tree in training data
+  leaf_indices_t_train <- leaf_indices_train[, t]
+  
+  # Get leaf information for current tree
+  leaf_info <- get_leaf_info(t)
+  leaf_values <- leaf_info$leaf_values
+  
+  # Get unique leaf indices
+  unique_leaves_train <- unique(leaf_indices_t_train)
+  
+  # Create mapping from leaf indices to sequential numbers
+  leaf_id_map_train <- setNames(seq_along(unique_leaves_train), unique_leaves_train)
+  
+  # Map leaf indices to sequential IDs
+  leaf_ids_mapped_train <- leaf_id_map_train[as.character(leaf_indices_t_train)]
+  
+  # Number of leaves in current tree
+  L_train <- length(unique_leaves_train)
+  
+  # Create indicator matrix Z_train (n_train x L_train)
+  Z_train <- sparseMatrix(
+    i = 1:n_train,
+    j = leaf_ids_mapped_train,
+    x = 1,
+    dims = c(n_train, L_train)
+  )
+  
+  # Compute number of observations in each leaf (n_l)
+  n_l_train <- tabulate(leaf_ids_mapped_train, nbins = L_train)
+  
+  # Compute smoother matrix S^{tree}_train for current tree
+  D_inv_nl_train <- 1 / (n_l_train + params$lambda)  # Include regularization
+  D_train <- Diagonal(x = D_inv_nl_train)
+  
+  # Compute S^{tree}_train = Z_train * D_train * t(Z_train)
+  S_tree_train <- Z_train %*% D_train %*% t(Z_train)
+  
+  # ------------------------------
+  # Processing Test Data
+  # ------------------------------
+  
+  # Get leaf indices for current tree in test data
+  leaf_indices_t_test <- leaf_indices_test[, t]
+  
+  # Map leaf indices to the same sequential IDs as training
+  # If a test leaf index was not seen in training, it won't be in leaf_id_map_train
+  # Assign NA to unseen leaves and handle accordingly
+  leaf_ids_mapped_test <- leaf_id_map_train[as.character(leaf_indices_t_test)]
+  
+  # Replace NA with 0 (assuming no contribution for unseen leaves)
+  # Since sparseMatrix indices start at 1, we need to handle 0 appropriately
+  # We'll remove entries where leaf_ids_mapped_test is NA
+  valid_test <- !is.na(leaf_ids_mapped_test)
+  leaf_ids_mapped_test_valid <- leaf_ids_mapped_test[valid_test]
+  test_rows_valid <- which(valid_test)
+  
+  # Number of leaves in training data is L_train
+  # Create indicator matrix Z_test (n_test x L_train)
+  # Only include valid mappings
+  Z_test <- sparseMatrix(
+    i = test_rows_valid,
+    j = leaf_ids_mapped_test_valid,
+    x = 1,
+    dims = c(n_test, L_train)
+  )
+  
+  # Compute smoother matrix S^{tree}_test = Z_test * D_train * t(Z_train)
+  S_tree_test <- Z_test %*% D_train %*% t(Z_train)
+  
+  # ------------------------------
+  # Update Boosted Smoother Matrices
+  # ------------------------------
+  
+  # Store previous S_boost_train
+  S_boost_prev <- S_boost_train
+  
+  # Update S_boost_train using the recursive formula
+  # S_boost_train_new = S_boost_prev + eta * (S_tree_train - S_tree_train %*% S_boost_prev)
+  S_boost_train <- S_boost_prev + eta * (S_tree_train - S_tree_train %*% S_boost_prev)
+  
+  # Update S_boost_test using the recursive formula
+  # S_boost_test_new = S_boost_test + eta * (S_tree_test - S_tree_test %*% S_boost_prev)
+  S_boost_test <- S_boost_test + eta * (S_tree_test - S_tree_test %*% S_boost_prev)
+}
+
+# ------------------------------
+# Step 5: Verify Predictions
+# ------------------------------
+
+# Get predictions from the XGBoost model
+pred_train_xgb <- predict(bst, dtrain)
+pred_test_xgb <- predict(bst, dtest)
+
+# Compute predictions using the smoother matrices
+pred_train_smoother <- as.numeric(S_boost_train %*% Y_train)
+pred_test_smoother <- as.numeric(S_boost_test %*% Y_train)
+
+# Compare the predictions for training data
+comparison_train <- data.frame(
+  Observation = 1:n_train,
+  Pred_XGBoost = pred_train_xgb,
+  Pred_Smoother = pred_train_smoother
+)
+
+# Compare the predictions for test data
+comparison_test <- data.frame(
+  Observation = 1:n_test,
+  Pred_XGBoost = pred_test_xgb,
+  Pred_Smoother = pred_test_smoother
+)
+
+# Print the comparison results
+cat("=== Training Data Predictions ===\n")
+print(comparison_train)
+cat("\n=== Test Data Predictions ===\n")
+print(comparison_test)
+
+```
+
+
+
+```{r}
+plot(pred_train_xgb, pred_train_smoother, col = "blue", pch = 16,
+     main = "Train vs Test Predictions", xlab = "XGB Predictions", ylab = "Smoother Predictions")
+
+
+points(pred_test_xgb, pred_test_smoother, col = "orange", pch = 17)
+
+
+legend("bottomright", legend = c("Train", "Test"), col = c("blue", "orange"), pch = c(16, 17))
+
+
+abline(a = 0, b = 1, col = "red", lty = 2) # reference line for equivalence
+```
+```{r}
+all.equal(as.numeric(pred_train_smoother),as.numeric(pred_train_xgb))
+```
+

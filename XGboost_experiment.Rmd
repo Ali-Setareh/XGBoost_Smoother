@@ -1,0 +1,1120 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+library(hdm)
+library(grf)
+library(xgboost)
+library(caret)
+library(glue)
+library(tidyverse)
+source("xgboost_smoother_2.R")
+```
+
+
+```{r}
+# Updated Data Generating Process for 10 Dimensions
+y_function_smooth = function(X, b) {
+  y = sin(X %*% b)  # Base function using sin
+  return(y)
+}
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Define the number of dimensions (10-dimensional)
+p = 1
+j = 1
+
+# Generate coefficients b with decaying influence
+b = rep(1, p) / ((1:p)^j)
+
+# Generate 10-dimensional X matrix
+n = 1000  # Number of observations
+X = matrix(runif(n * p, -5, 5), ncol = p)  # Uniformly distributed data
+
+# Generate Y and y_true using the function
+Y = y_function_smooth(X, b) + rnorm(n, sd = 0.5)  # Adding noise
+y_true = y_function_smooth(X, b)
+
+# Convert to tibble and assign column names as X1, X2, ..., X10
+library(tibble)
+df <- as_tibble(X, .name_repair = "unique") %>%
+  setNames(paste0("X", 1:p)) %>%  # Rename columns to X1, X2, ..., X10
+  mutate(Y = as.numeric(Y), y_true = as.numeric(y_true))
+
+# Preview the data
+print(head(df))
+
+```
+
+```{r}
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Create training and testing indices (70% training, 30% testing)
+train_index <- createDataPartition(df$Y, p = 0.7, list = FALSE)
+
+# Split the data into training and testing sets
+data_train <- df[train_index, ]
+data_test <- df[-train_index, ]
+
+# Separate the response variable (Y) and features (X) for training and testing sets
+Y_train <- data_train$Y
+X_train <- data_train %>% select(starts_with("X"))  # Select all X1, X2, ..., X10 columns
+
+Y_test <- data_test$Y
+X_test <- data_test %>% select(starts_with("X"))  # Select all X1, X2, ..., X10 columns
+
+# Print a summary of the splits
+print(paste("Number of training samples:", nrow(X_train)))
+print(paste("Number of testing samples:", nrow(X_test)))
+```
+```{r}
+?predict.xgb.Booster
+```
+
+
+```{r}
+# eta [default=0.3, range: [0, 1]]
+# gamma [default=0, alias: min_split_loss, range: [0, ∞]]
+# max_depth [default=6, range: [0, ∞]]
+# min_child_weight [default=1, range: [0, ∞]]
+# max_delta_step [default=0, range: [0, ∞]]
+# subsample [default=1, range: (0, 1]]
+# sampling_method [default=uniform, choices: uniform, gradient_based]
+# colsample_bytree [default=1, range: (0, 1]]
+# colsample_bylevel [default=1, range: (0, 1]]
+# colsample_bynode [default=1, range: (0, 1]]
+# lambda [default=1, alias: reg_lambda, range: [0, ∞]]
+# alpha [default=0, alias: reg_alpha, range: [0, ∞]]
+# tree_method [default=auto, choices: auto, exact, approx, hist]
+# scale_pos_weight [default=1]
+# updater [advanced: specifies sequence of tree updaters]
+# refresh_leaf [default=1, choices: 0, 1]
+# process_type [default=default, choices: default, update]
+# grow_policy [default=depthwise, choices: depthwise, lossguide]
+# max_leaves [default=0]
+# max_bin [default=256]
+# num_parallel_tree [default=1]
+# monotone_constraints [constraint of variable monotonicity]
+# interaction_constraints [nest list of permitted feature interactions]
+
+```
+
+```{r}
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X_train), label = Y_train)
+dtest = xgb.DMatrix(data = as.matrix(X_test), label = Y_test)
+
+glue("train dimensions: {dim(dtrain)[1]} x {dim(dtrain)[2]}")
+glue("test dimensions: {dim(dtest)[1]} x {dim(dtest)[2]}")
+# Define model parameters
+params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 1, # Equivalent to learning_rate
+  max_depth = 6, # Need to specify a value as XGBoost requires a numerical value
+  min_child_weight = 1, # Not a direct equivalent but serves to control over-fitting
+  subsample = 1,
+  colsample_bytree = 1, # Equivalent to 'sqrt' in max_features
+  # Note: XGBoost does not have a direct equivalent for 'max_leaf_nodes' and 'init'
+  lambda = 0,
+  alpha = 0,
+  base_score = 0.0,
+  colsample_bynode = 1,
+  colsample_bylevel = 1
+)
+
+# eta: Default: 0.3
+# gamma: Default: 0
+# max_depth: Default: 6
+# min_child_weight: Default: 1
+# subsample: Default: 1
+# colsample_bytree: Default: 1
+# lambda: Default: 1
+# alpha: Default: 0
+# num_parallel_tree: Default: 1
+# Number of boosting rounds (equivalent to n_estimators)
+nrounds = 10
+
+# Train the model
+model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
+```
+
+
+```{r}
+output_dir = "H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment"
+smoothers = get_xgboost_weights(model,dtrain,dtest,save_output = TRUE,output_dir = output_dir)
+
+smoother_train = smoothers$S_train
+smoother_test = smoothers$S_test
+
+
+xgb_pred_train = predict(model, dtrain, outputmargin = TRUE)
+xgb_pred_test = predict(model, dtest, outputmargin = TRUE)
+
+#smoother_pred_train = smoother_train%*% getinfo(dtrain, "label")
+#smoother_pred_test = smoother_test%*% getinfo(dtrain, "label")
+
+smoother_pred_train = smoother_train%*% Y_train
+smoother_pred_test = smoother_test%*% Y_train
+
+```
+
+
+```{r}
+xgb_pred_train = predict(model, dtrain, iterationrange = c(1,4) ,outputmargin = TRUE)
+xgb_pred_test = predict(model, dtest, iterationrange = c(1,4) ,outputmargin = TRUE)
+smoother_train = readRDS("H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_train_3.rds")
+smoother_test = readRDS("H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_test_3.rds")
+
+smoother_pred_train = smoother_train%*% Y_train
+smoother_pred_test = smoother_test%*% Y_train
+
+comparison_train = all.equal(as.numeric(smoother_pred_train), xgb_pred_train)
+comparison_test = all.equal(as.numeric(smoother_pred_test), xgb_pred_test)
+```
+
+```{r}
+comparison_test
+```
+```{r}
+dim(smoother_pred_train)
+length(xgb_pred_train)
+               
+```
+
+
+```{r}
+getinfo(dtrain, "label")
+```
+```{r}
+Y_train
+```
+```{r}
+as.numeric(smoother_pred_train)
+```
+```{r}
+library(float)
+length(Y_train)
+str(Y_train)
+float(as.numeric(Y_train))
+
+as.numeric(Y_train)
+
+float::float(Y_train)
+```
+
+```{r}
+float(matrix(Y_train, ncol = 1))
+```
+
+
+```{r}
+all.equal(as.numeric(smoother_pred_train),as.numeric(xgb_pred_train))
+all.equal(as.numeric(smoother_pred_test),as.numeric(xgb_pred_test))
+```
+```{r}
+smoother_train
+```
+```{r}
+xgb_pred_train
+```
+```{r}
+smoother_pred_train
+```
+```{r}
+m <- readRDS("H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_train_1.rds")
+m
+```
+```{r}
+current_tree_indices_train = predict(model, dtrain, predleaf = TRUE)
+S_train = outer(current_tree_indices_train, current_tree_indices_train, FUN = "==")
+rowSums(S_train)
+S_train/(rowSums(S_train))
+```
+
+```{r}
+current_tree_indices_train
+```
+
+
+```{r}
+predict(model, dtrain, predleaf = TRUE)
+```
+```{r}
+1/6
+```
+
+```{r}
+xgb.plot.tree(model = model,trees = 0)
+```
+```{r}
+xgb.model.dt.tree(model = model)
+```
+
+
+```{r}
+# Define default parameters
+default_params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.3,
+  gamma = 0,
+  max_depth = 6,
+  min_child_weight = 1,
+  max_delta_step = 0,
+  subsample = 1,
+  sampling_method = 'uniform',
+  colsample_bytree = 1,
+  colsample_bylevel = 1,
+  colsample_bynode = 1,
+  lambda = 1,
+  alpha = 0,
+  tree_method = 'auto',
+  scale_pos_weight = 1,
+  refresh_leaf = 1,
+  process_type = 'default',
+  grow_policy = 'depthwise',
+  max_leaves = 0,
+  max_bin = 256,
+  base_score = 0.0
+)
+
+# Define parameter ranges
+parameters_list = list(
+  eta = seq(0.01, 1, length.out = 10),
+  gamma = seq(0, 10, length.out = 10),
+  max_depth = 1:10,
+  min_child_weight = seq(0, 10, length.out = 10),
+  #max_delta_step = seq(0, 10, length.out = 10),
+  subsample = seq(0.1, 1, length.out = 10),
+  sampling_method = c('uniform', 'gradient_based'),
+  colsample_bytree = seq(0.1, 1, length.out = 10),
+  colsample_bylevel = seq(0.1, 1, length.out = 10),
+  colsample_bynode = seq(0.1, 1, length.out = 10),
+  lambda = seq(0, 10, length.out = 10),
+  #alpha = seq(0, 10, length.out = 10),
+  tree_method = c('auto', 'exact', 'approx', 'hist'),
+  refresh_leaf = c(0, 1),
+  process_type = c('default', 'update'),
+  grow_policy = c('depthwise', 'lossguide'),
+  max_leaves = 0:10,
+  max_bin = as.integer(seq(10, 256, length.out = 10))
+)
+
+# Define parameter types
+param_types = list(
+  eta = 'numeric',
+  gamma = 'numeric',
+  max_depth = 'integer',
+  min_child_weight = 'numeric',
+  #max_delta_step = 'numeric',
+  subsample = 'numeric',
+  sampling_method = 'character',
+  colsample_bytree = 'numeric',
+  colsample_bylevel = 'numeric',
+  colsample_bynode = 'numeric',
+  lambda = 'numeric',
+  #alpha = 'numeric',
+  tree_method = 'character',
+  refresh_leaf = 'integer',
+  process_type = 'character',
+  grow_policy = 'character',
+  max_leaves = 'integer',
+  max_bin = 'integer'
+)
+
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X_train), label = Y_train)
+dtest = xgb.DMatrix(data = as.matrix(X_test), label = Y_test)
+
+output_dir = "H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment"
+
+# Initialize results data frame
+results = data.frame()
+
+# Number of boosting rounds
+nrounds = 1000
+
+# Loop over each parameter
+for (param_name in names(parameters_list)) {
+  param_values = parameters_list[[param_name]]
+  param_type = param_types[[param_name]]
+  
+  for (value in param_values) {
+    # Create a copy of default parameters
+    params = default_params
+    
+    # Cast value to appropriate type
+    if (param_type == 'numeric') {
+      value_casted = as.numeric(value)
+    } else if (param_type == 'integer') {
+      value_casted = as.integer(value)
+    } else if (param_type == 'character') {
+      value_casted = as.character(value)
+    }
+    
+    # Update the parameter
+    params[[param_name]] = value_casted
+    
+    # Print progress
+    print(paste("Testing", param_name, "=", value_casted))
+    
+    # Try to train the model and catch any errors
+    tryCatch({
+      # Train the model
+      model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
+      
+      # Get the smoothers
+      smoothers = get_xgboost_weights(model, dtrain, dtest,save_output = TRUE, output_dir = output_dir)
+      smoother_train = smoothers$S_train
+      smoother_test = smoothers$S_test
+      
+      # Make predictions
+      xgb_pred_train = predict(model, dtrain)
+      xgb_pred_test = predict(model, dtest)
+      smoother_pred_train = as.numeric(smoother_train %*% Y_train)
+      smoother_pred_test = as.numeric(smoother_test %*% Y_train)
+      
+      # Compare predictions
+      comparison_train = all.equal(smoother_pred_train, xgb_pred_train)
+      comparison_test = all.equal(smoother_pred_test, xgb_pred_test)
+      
+      # Store results
+      result_row = data.frame(
+        param = param_name,
+        value = as.character(value_casted),
+        comparison_train = as.character(comparison_train),
+        comparison_test = as.character(comparison_test),
+        stringsAsFactors = FALSE
+      )
+      
+      results = rbind(results, result_row)
+    }, error = function(e) {
+      # Store error message if model training fails
+      result_row = data.frame(
+        param = param_name,
+        value = as.character(value_casted),
+        comparison_train = paste("Error:", e$message),
+        comparison_test = paste("Error:", e$message),
+        stringsAsFactors = FALSE
+      )
+      
+      results = rbind(results, result_row)
+    })
+  }
+}
+
+# View the results
+```
+
+# Experiment to compare error 
+
+```{r}
+# Define default parameters
+default_params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.3,
+  gamma = 0,
+  max_depth = 6,
+  min_child_weight = 1,
+  max_delta_step = 0,
+  subsample = 1,
+  sampling_method = 'uniform',
+  colsample_bytree = 1,
+  colsample_bylevel = 1,
+  colsample_bynode = 1,
+  lambda = 1,
+  alpha = 0,
+  tree_method = 'auto',
+  scale_pos_weight = 1,
+  refresh_leaf = 1,
+  process_type = 'default',
+  grow_policy = 'depthwise',
+  max_leaves = 0,
+  max_bin = 256,
+  base_score = 0.0
+)
+
+# Define parameter ranges
+parameters_list = list(
+  eta = seq(0.01, 1, length.out = 10),
+  gamma = seq(0, 10, length.out = 10),
+  max_depth = 1:10,
+  min_child_weight = seq(0, 10, length.out = 10),
+  #max_delta_step = seq(0, 10, length.out = 10),
+  subsample = seq(0.1, 1, length.out = 10),
+  sampling_method = c('uniform', 'gradient_based'),
+  colsample_bytree = seq(0.1, 1, length.out = 10),
+  colsample_bylevel = seq(0.1, 1, length.out = 10),
+  colsample_bynode = seq(0.1, 1, length.out = 10),
+  lambda = seq(0, 10, length.out = 10),
+  #alpha = seq(0, 10, length.out = 10),
+  tree_method = c('auto', 'exact', 'approx', 'hist'),
+  refresh_leaf = c(0, 1),
+  process_type = c('default', 'update'),
+  grow_policy = c('depthwise', 'lossguide'),
+  max_leaves = 0:10,
+  max_bin = as.integer(seq(10, 256, length.out = 10))
+)
+
+# Define parameter types
+param_types = list(
+  eta = 'numeric',
+  gamma = 'numeric',
+  max_depth = 'integer',
+  min_child_weight = 'numeric',
+  #max_delta_step = 'numeric',
+  subsample = 'numeric',
+  sampling_method = 'character',
+  colsample_bytree = 'numeric',
+  colsample_bylevel = 'numeric',
+  colsample_bynode = 'numeric',
+  lambda = 'numeric',
+  #alpha = 'numeric',
+  tree_method = 'character',
+  refresh_leaf = 'integer',
+  process_type = 'character',
+  grow_policy = 'character',
+  max_leaves = 'integer',
+  max_bin = 'integer'
+)
+
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X_train), label = Y_train)
+dtest = xgb.DMatrix(data = as.matrix(X_test), label = Y_test)
+
+output_dir = "H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment"
+
+# Initialize results data frame
+results = data.frame()
+
+# Number of boosting rounds
+nrounds = 1000
+
+# Loop over each parameter
+for (param_name in names(parameters_list)) {
+  param_values = parameters_list[[param_name]]
+  param_type = param_types[[param_name]]
+  
+  for (value in param_values) {
+    # Create a copy of default parameters
+    params = default_params
+    
+    # Cast value to appropriate type
+    if (param_type == 'numeric') {
+      value_casted = as.numeric(value)
+    } else if (param_type == 'integer') {
+      value_casted = as.integer(value)
+    } else if (param_type == 'character') {
+      value_casted = as.character(value)
+    }
+    
+    # Update the parameter
+    params[[param_name]] = value_casted
+    
+    # Print progress
+    print(paste("Testing", param_name, "=", value_casted))
+    
+    # Try to train the model and catch any errors
+    tryCatch({
+      # Train the model
+      model = xgb.train(params = params, data = dtrain, nrounds = nrounds)
+      
+      # Get the smoothers
+      smoothers = get_xgboost_weights(model, dtrain, dtest,save_output = TRUE, output_dir = output_dir)
+      
+      for i in range(1,nrounds+1):
+        
+        smoother_train = readRDS(f"H:/MyDrive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_train_{i}.rds")
+        smoother_test = readRDS(f"H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_test_{i}.rds")
+        
+        
+      
+        # Make predictions
+        xgb_pred_train = predict(model, dtrain, iterationrange = (1,i+1))
+        xgb_pred_test = predict(model, dtest, iterationrange = (1,i+1))
+        smoother_pred_train = as.numeric(smoother_train %*% Y_train)
+        smoother_pred_test = as.numeric(smoother_test %*% Y_train)
+        
+        # save the 
+      
+        # Compare predictions
+        comparison_train = all.equal(as.numeric(smoother_pred_train), xgb_pred_train)
+        comparison_test = all.equal(as.numeric(smoother_pred_test), xgb_pred_test)
+      
+      # Store results
+        
+        results.loc[i,[names of params]] = current list of params 
+        
+        results.loc[i,"comparison_train"] = comparison_train
+        results.loc[i,"comparison_test"] = comparison_test
+      
+      
+      
+      
+      
+    })
+  }
+}
+
+
+```
+
+```{r}
+# Number of boosting rounds
+nrounds = 1000
+
+# Create column names:
+#  - "param_name", "param_value"
+#  - "comparison_train_round1", "comparison_test_round1", ...
+#  - "comparison_train_round1000", "comparison_test_round1000"
+results_cols = c(
+  "param_name",
+  "param_value",
+  as.vector(rbind(
+    paste0("comparison_train_round", 1:nrounds),
+    paste0("comparison_test_round", 1:nrounds)
+  ))
+)
+
+# Initialize results data frame with 0 rows but the required columns
+results = data.frame(matrix(ncol = length(results_cols), nrow = 0))
+colnames(results) = results_cols
+
+results
+
+```
+
+```{r}
+# Define default parameters
+default_params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.3,
+  gamma = 0,
+  max_depth = 6,
+  min_child_weight = 1,
+  max_delta_step = 0,
+  subsample = 1,
+  sampling_method = 'uniform',
+  colsample_bytree = 1,
+  colsample_bylevel = 1,
+  colsample_bynode = 1,
+  lambda = 1,
+  alpha = 0,
+  tree_method = 'auto',
+  scale_pos_weight = 1,
+  refresh_leaf = 1,
+  process_type = 'default',
+  grow_policy = 'depthwise',
+  max_leaves = 0,
+  max_bin = 256,
+  base_score = 0.0
+)
+
+# Define parameter ranges
+parameters_list = list(
+  eta = seq(0.01, 1, length.out = 10),
+  gamma = seq(0, 10, length.out = 10),
+  max_depth = 1:10,
+  min_child_weight = seq(0, 10, length.out = 10),
+  #max_delta_step = seq(0, 10, length.out = 10),
+  subsample = seq(0.1, 1, length.out = 10),
+  sampling_method = c('uniform', 'gradient_based'),
+  colsample_bytree = seq(0.1, 1, length.out = 10),
+  colsample_bylevel = seq(0.1, 1, length.out = 10),
+  colsample_bynode = seq(0.1, 1, length.out = 10),
+  lambda = seq(0, 10, length.out = 10),
+  #alpha = seq(0, 10, length.out = 10),
+  tree_method = c('auto', 'exact', 'approx', 'hist'),
+  refresh_leaf = c(0, 1),
+  process_type = c('default', 'update'),
+  grow_policy = c('depthwise', 'lossguide'),
+  max_leaves = 0:10,
+  max_bin = as.integer(seq(10, 256, length.out = 10))
+)
+
+# Define parameter types
+param_types = list(
+  eta = 'numeric',
+  gamma = 'numeric',
+  max_depth = 'integer',
+  min_child_weight = 'numeric',
+  #max_delta_step = 'numeric',
+  subsample = 'numeric',
+  sampling_method = 'character',
+  colsample_bytree = 'numeric',
+  colsample_bylevel = 'numeric',
+  colsample_bynode = 'numeric',
+  lambda = 'numeric',
+  #alpha = 'numeric',
+  tree_method = 'character',
+  refresh_leaf = 'integer',
+  process_type = 'character',
+  grow_policy = 'character',
+  max_leaves = 'integer',
+  max_bin = 'integer'
+)
+
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X_train), label = Y_train)
+dtest = xgb.DMatrix(data = as.matrix(X_test), label = Y_test)
+
+output_dir = "H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment"
+
+
+
+nrounds = 3
+
+
+convert_all_equal_to_numeric <- function(x) {
+  if (isTRUE(x)) {
+    return(0)
+  } else if (is.character(x) && grepl("Mean relative difference:", x)) {
+    # Extract numeric part
+    val_str <- sub(".*Mean relative difference:\\s*", "", x)
+    return(as.numeric(val_str))
+  } else {
+    # Some other mismatch message
+    return(NA_real_)
+  }
+}
+
+
+all_param_cols <- names(default_params)
+
+
+comparison_cols <- as.vector(rbind(
+  paste0("comparison_train_round", 1:nrounds),
+  paste0("comparison_test_round", 1:nrounds)
+))
+
+
+results_cols <- c(all_param_cols, comparison_cols)
+
+
+results = data.frame(
+  matrix(ncol = length(results_cols), nrow = 0),
+  stringsAsFactors = FALSE
+)
+colnames(results) = results_cols
+
+
+for (param_name in names(parameters_list)) {
+  param_values = parameters_list[[param_name]]
+  param_type   = param_types[[param_name]]
+  
+  for (value in param_values) {
+    
+    params = default_params
+    
+    # Cast value to the correct type
+    if (param_type == 'numeric') {
+      value_casted = as.numeric(value)
+    } else if (param_type == 'integer') {
+      value_casted = as.integer(value)
+    } else if (param_type == 'character') {
+      value_casted = as.character(value)
+    }
+    
+    
+    params[[param_name]] = value_casted
+    
+    
+    message("Testing ", param_name, " = ", value_casted)
+    
+    
+    tryCatch({
+     
+      model = xgb.train(
+        params  = params,
+        data    = dtrain,
+        nrounds = nrounds,
+        verbose = 0  # turn off printing
+      )
+      
+      
+      _ = get_xgboost_weights(
+        model,
+        dtrain,
+        dtest,
+        save_output = TRUE,
+        output_dir  = output_dir
+      )
+      
+      
+      train_comps = numeric(nrounds)
+      test_comps  = numeric(nrounds)
+      
+      
+      for (i in seq_len(nrounds)) {
+        
+        
+        smoother_train = readRDS(
+          paste0("H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_train_", i, ".rds")
+        )
+        smoother_test  = readRDS(
+          paste0("H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_test_", i, ".rds")
+        )
+        
+        
+        xgb_pred_train = predict(model, dtrain, iterationrange = c(1, i + 1))
+        xgb_pred_test  = predict(model, dtest,  iterationrange = c(1, i + 1))
+        
+        
+        smoother_pred_train = as.numeric(smoother_train %*% Y_train)
+        smoother_pred_test  = as.numeric(smoother_test  %*% Y_train)
+        
+        
+        comp_train = all.equal(smoother_pred_train, xgb_pred_train)
+        comp_test  = all.equal(smoother_pred_test,  xgb_pred_test)
+        
+        train_comps[i] = convert_all_equal_to_numeric(comp_train)
+        test_comps[i]  = convert_all_equal_to_numeric(comp_test)
+      }
+      
+      
+      param_values_all = sapply(all_param_cols, function(x) as.character(params[[x]]))
+      
+      
+      comparisons_wide = as.vector(rbind(train_comps, test_comps))
+      
+      result_vector = c(param_values_all, comparisons_wide)
+      
+      new_row = data.frame(
+        matrix(result_vector, nrow = 1),
+        stringsAsFactors = FALSE
+      )
+      colnames(new_row) = results_cols
+      
+      results = rbind(results, new_row)
+      
+    }, error = function(e) {
+      message("Error for parameter: ", param_name, " value: ", value_casted)
+      message("Error message: ", e$message)
+    })
+  }
+}
+
+
+
+```
+```{r}
+# Define default parameters
+default_params = list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.3,
+  gamma = 0,
+  max_depth = 6,
+  min_child_weight = 1,
+  max_delta_step = 0,
+  subsample = 1,
+  sampling_method = 'uniform',
+  colsample_bytree = 1,
+  colsample_bylevel = 1,
+  colsample_bynode = 1,
+  lambda = 1,
+  alpha = 0,
+  tree_method = 'auto',
+  scale_pos_weight = 1,
+  refresh_leaf = 1,
+  process_type = 'default',
+  grow_policy = 'depthwise',
+  max_leaves = 0,
+  max_bin = 256,
+  base_score = 0.0
+)
+
+# Define parameter ranges
+parameters_list = list(
+  eta = seq(0.01, 1, length.out = 10),
+  gamma = seq(0, 10, length.out = 10),
+  max_depth = 1:10,
+  min_child_weight = seq(0, 10, length.out = 10),
+  #max_delta_step = seq(0, 10, length.out = 10),
+  #subsample = seq(0.1, 1, length.out = 10),
+  sampling_method = c('uniform', 'gradient_based'),
+  colsample_bytree = seq(0.1, 1, length.out = 10),
+  colsample_bylevel = seq(0.1, 1, length.out = 10),
+  colsample_bynode = seq(0.1, 1, length.out = 10),
+  lambda = seq(0, 10, length.out = 10),
+  #alpha = seq(0, 10, length.out = 10),
+  tree_method = c('auto', 'exact', 'approx', 'hist'),
+  refresh_leaf = c(0, 1),
+  #process_type = c('default', 'update'),
+  grow_policy = c('depthwise', 'lossguide'),
+  max_leaves = 0:10,
+  max_bin = as.integer(seq(10, 256, length.out = 10))
+)
+
+# Define parameter types
+param_types = list(
+  eta = 'numeric',
+  gamma = 'numeric',
+  max_depth = 'integer',
+  min_child_weight = 'numeric',
+  #max_delta_step = 'numeric',
+  #subsample = 'numeric',
+  sampling_method = 'character',
+  colsample_bytree = 'numeric',
+  colsample_bylevel = 'numeric',
+  colsample_bynode = 'numeric',
+  lambda = 'numeric',
+  #alpha = 'numeric',
+  tree_method = 'character',
+  refresh_leaf = 'integer',
+  #process_type = 'character',
+  grow_policy = 'character',
+  max_leaves = 'integer',
+  max_bin = 'integer'
+)
+
+# Convert to DMatrix object
+dtrain = xgb.DMatrix(data = as.matrix(X_train), label = Y_train)
+dtest = xgb.DMatrix(data = as.matrix(X_test), label = Y_test)
+
+output_dir = "H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment"
+
+
+# Number of boosting rounds
+nrounds = 100
+
+
+convert_all_equal_to_numeric = function(x) {
+  if (isTRUE(x)) {
+    return(0)
+  } else if (is.character(x) && grepl("Mean relative difference:", x)) {
+    # Extract numeric part
+    val_str = sub(".*Mean relative difference:\\s*", "", x)
+    return(as.numeric(val_str))
+  } else {
+    # Some other mismatch message
+    return(NA_real_)
+  }
+}
+
+
+all_param_cols = names(default_params)
+
+
+comparison_cols = as.vector(rbind(
+  paste0("comparison_train_round", 1:nrounds),
+  paste0("comparison_test_round", 1:nrounds)
+))
+
+
+results_cols = c(all_param_cols, comparison_cols)
+
+
+results = data.frame(
+  matrix(ncol = length(results_cols), nrow = 0),
+  stringsAsFactors = FALSE
+)
+colnames(results) =  results_cols
+
+
+
+
+for (param_name in names(parameters_list)) {
+  param_values = parameters_list[[param_name]]
+  param_type   = param_types[[param_name]]
+  
+  for (value in param_values) {
+    
+    params = default_params
+    
+    
+    if (param_type == 'numeric') {
+      value_casted = as.numeric(value)
+    } else if (param_type == 'integer') {
+      value_casted = as.integer(value)
+    } else if (param_type == 'character') {
+      value_casted = as.character(value)
+    }
+    
+    
+    params[[param_name]] = value_casted
+    
+    
+    message("Testing ", param_name, " = ", value_casted)
+    
+    
+    tryCatch({
+      
+      model <- xgb.train(
+        params  = params,
+        data    = dtrain,
+        nrounds = nrounds,
+        verbose = 0  # turn off printing
+      )
+      
+      
+      smoothers = get_xgboost_weights(
+        model,
+        dtrain,
+        dtest,
+        save_output = TRUE,
+        output_dir  = output_dir
+      )
+      
+      
+      train_comps = numeric(nrounds)
+      test_comps  = numeric(nrounds)
+      
+      
+      for (i in seq_len(nrounds)) {
+       
+        smoother_train = readRDS(
+          paste0("H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_train_", i, ".rds")
+        )
+        smoother_test  = readRDS(
+          paste0("H:/My Drive/Job/CausalInference/XGBoost_Smoother/xgboost_experiment/S_curr_iteration_test_", i, ".rds")
+        )
+        
+        
+        xgb_pred_train = predict(model, dtrain, iterationrange = c(1, i + 1))
+        xgb_pred_test  = predict(model, dtest,  iterationrange = c(1, i + 1))
+        
+        
+        smoother_pred_train = as.numeric(smoother_train %*% Y_train)
+        smoother_pred_test  = as.numeric(smoother_test  %*% Y_train)
+        
+        
+        comp_train = all.equal(smoother_pred_train, xgb_pred_train)
+        comp_test  = all.equal(smoother_pred_test,  xgb_pred_test)
+        
+        train_comps[i] = convert_all_equal_to_numeric(comp_train)
+        test_comps[i]  = convert_all_equal_to_numeric(comp_test)
+      }
+      
+      
+      param_values_all = sapply(all_param_cols, function(x) as.character(params[[x]]))
+      
+      
+      comparisons_wide = as.vector(rbind(train_comps, test_comps))
+      
+      
+      result_vector = c(param_values_all, comparisons_wide)
+      
+      
+      new_row = data.frame(
+        matrix(result_vector, nrow = 1),
+        stringsAsFactors = FALSE
+      )
+      colnames(new_row) = results_cols
+      
+
+      results = rbind(results, new_row)
+      
+    }, error = function(e) {
+      message("Error for parameter: ", param_name, " value: ", value_casted)
+      message("Error message: ", e$message)
+    })
+  }
+}
+
+
+```
+
+```{r}
+write.csv(results, "results.csv", row.names = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+results = read.csv("results.csv")
+
+train_cols = grep("^comparison_train_round", colnames(results))
+test_cols  = grep("^comparison_test_round",  colnames(results))
+
+nrounds_detected = length(train_cols)
+message("Detected ", nrounds_detected, " boosting rounds in the results data.")
+
+
+train_long = data.frame(
+  param_row = rep(seq_len(nrow(results)), each = nrounds_detected),
+  round     = rep(seq_len(nrounds_detected), times = nrow(results)),
+  value     = as.numeric(unlist(results[, train_cols]))
+)
+
+
+test_long = data.frame(
+  param_row = rep(seq_len(nrow(results)), each = nrounds_detected),
+  round     = rep(seq_len(nrounds_detected), times = nrow(results)),
+  value     = as.numeric(unlist(results[, test_cols]))
+)
+
+
+train_stats = train_long %>%
+  group_by(round) %>%
+  summarise(
+    mean_value = mean(value, na.rm = TRUE),
+    sd_value   = sd(value, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    lower = mean_value - sd_value,
+    upper = mean_value + sd_value
+  )
+
+
+test_stats = test_long %>%
+  group_by(round) %>%
+  summarise(
+    mean_value = mean(value, na.rm = TRUE),
+    sd_value   = sd(value, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    lower = mean_value - sd_value,
+    upper = mean_value + sd_value
+  )
+
+p_train <- ggplot(train_stats, aes(x = round, y = mean_value)) +
+  # Line for the mean
+  geom_line(color = "blue") +
+  # Ribbon for the lower/upper bounds
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              fill = "blue", alpha = 0.2) +
+  labs(
+    title = "Average Train Comparison Over Different sets of parameters",
+    x = "Boosting Round",
+    y = "Mean (± SD) of Comparison"
+  ) +
+  theme_minimal()
+
+
+p_test <- ggplot(test_stats, aes(x = round, y = mean_value)) +
+  geom_line(color = "red") +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              fill = "red", alpha = 0.2) +
+  labs(
+    title = "Average Test Comparison Over Different sets of parameters",
+    x = "Boosting Round",
+    y = "Mean (± SD) of Comparison"
+  ) +
+  theme_minimal()
+
+print(p_train)
+print(p_test)
+```
+
+```{r}
+ggsave("train_plot.png", p_train, width = 8, height = 6)
+ggsave("test_plot.png", p_test, width = 8, height = 6)
+```
+
+
+
