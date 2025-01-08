@@ -1,0 +1,213 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+# Load necessary libraries
+library(DoubleML)
+#library(mlr3)
+#library(mlr3learners)
+#library(mlr3tuning)
+library(mlr3verse)
+library(paradox)
+library(data.table)
+library(xgboost)
+source("xgboost_smoother_2.R")
+
+
+set.seed(123)
+
+# Define XGBoost learner
+ml_l = lrn("regr.xgboost")
+
+# Clone the learner for the nuisance models
+ml_m = ml_l$clone()
+
+# Generate DoubleML data 
+obj_dml_data = make_plr_CCDDHNR2018(alpha = 0.5)
+
+# Create the DoubleMLPLR object
+dml_plr_obj = DoubleMLPLR$new(obj_dml_data, ml_l, ml_m,n_folds = 3)
+
+
+param_grid = list(
+  "ml_l" = paradox::ps(
+    nrounds = paradox::p_int(lower = 10, upper = 100, tags = "budget"),  
+    eta = paradox::p_dbl(lower = 1e-4, upper = 1, logscale = TRUE),
+    max_depth = paradox::p_int(lower = 1, upper = 20),
+    colsample_bytree = paradox::p_dbl(lower = 1e-1, upper = 1),
+    colsample_bylevel = paradox::p_dbl(lower = 1e-1, upper = 1),
+    lambda = paradox::p_dbl(lower = 1e-3, upper = 1e3, logscale = TRUE),
+    alpha = paradox::p_dbl(lower = 1e-3, upper = 1e3, logscale = TRUE),
+    subsample = paradox::p_dbl(lower = 1e-1, upper = 1),
+    min_child_weight = paradox::p_int(lower = 1, upper = 100)
+  ),
+  "ml_m" = paradox::ps(
+    nrounds = paradox::p_int(lower = 10, upper = 100, tags = "budget"),  
+    eta = paradox::p_dbl(lower = 1e-4, upper = 1, logscale = TRUE),
+    max_depth = paradox::p_int(lower = 1, upper = 20),
+    colsample_bytree = paradox::p_dbl(lower = 1e-1, upper = 1),
+    colsample_bylevel = paradox::p_dbl(lower = 1e-1, upper = 1),
+    lambda = paradox::p_dbl(lower = 1e-3, upper = 1e3, logscale = TRUE),
+    alpha = paradox::p_dbl(lower = 1e-3, upper = 1e3, logscale = TRUE),
+    subsample = paradox::p_dbl(lower = 1e-1, upper = 1),
+    min_child_weight = paradox::p_int(lower = 1, upper = 100)
+  )
+)
+
+# Define tuning settings
+tune_settings = list(
+  terminator = mlr3tuning::trm("evals", n_evals = 50),  # Tune for 50 evaluations
+  algorithm = mlr3tuning::tnr("hyperband", eta = 2),    # Use hyperband algorithm
+  rsmp_tune = rsmp("cv", folds = 5),                   # 5-fold cross-validation
+  measure =list("ml_l" = msr("regr.mse"),"ml_m" = msr("regr.mse"))                             # Use MSE as performance measure
+)
+
+# Perform hyperparameter tuning
+dml_plr_obj$tune(param_set = param_grid, tune_settings = tune_settings)
+
+# Fit the DoubleML model with tuned parameters
+dml_plr_obj$fit(store_predictions = TRUE, store_models = TRUE)
+
+
+dml_plr_obj$summary()
+
+```
+
+```{r}
+obj_dml_data
+```
+
+```{r}
+dml_plr_obj$models$ml_l$d[[1]][[1]]$model
+```
+```{r}
+xgb.model.dt.tree(model = dml_plr_obj$models$ml_l$d[[1]][[1]]$model)
+```
+
+```{r}
+dml_plr_obj$models
+```
+
+```{r}
+xgb.model.dt.tree(model = dml_plr_obj$models$ml_l$d[[1]][[2]]$model)
+```
+
+
+```{r}
+learners = dml_plr_obj$models$ml_m
+learners$d[[1]]
+```
+```{r}
+dml_plr_obj$smpls[[1]]$test_ids
+```
+
+
+```{r}
+learners = dml_plr_obj$models$ml_m
+models_list = learners$d[[1]]
+test_ids_list = dml_plr_obj$smpls[[1]]$test_ids
+train_ids_list = dml_plr_obj$smpls[[1]]$train_ids
+```
+
+```{r}
+predictions_list = list()
+length_y = length(obj_dml_data$data$d)
+S = matrix(0,length_y,length_y)
+for (i in seq_along(models_list)) {
+  
+  cat(sprintf("\nprocessing fold %d:\n", i))
+  
+  model = models_list[[i]]$model
+  
+  test_ids = test_ids_list[[i]]
+  train_ids = train_ids_list[[i]]
+  
+  test_data = obj_dml_data$data[test_ids,obj_dml_data$x_cols,with = FALSE]
+  train_data = obj_dml_data$data[train_ids,obj_dml_data$x_cols,with = FALSE]
+  
+  test_matrix = as.matrix(test_data)
+  train_matrix = as.matrix(train_data)
+
+  
+  
+  #reorder the matrix:
+  
+  test_matrix = test_matrix[,model$feature_names]
+  train_matrix = train_matrix[,model$feature_names]
+  
+  dtest = xgboost::xgb.DMatrix(data = test_matrix)
+  dtrain = xgboost::xgb.DMatrix(data = train_matrix)
+
+  #leaf_indices = predict(model, newdata = dtest, predleaf = TRUE)
+  
+  
+  
+  #S[test_ids,train_ids] = create_S_from_gbtregressor(model,leaf_indices,output_dir,save_output = FALSE)
+ 
+  #print(S[1,4])
+  
+  smoothers = get_xgboost_weights(model,dtrain,dtest)
+  
+  S[test_ids,train_ids] = smoothers$S_test 
+  
+  
+}
+```
+
+```{r}
+d_hat_dml = dml_plr_obj$predictions$ml_m
+d_hat_smoother = (S %*% obj_dml_data$data$d) 
+```
+
+
+```{r}
+plot(d_hat_dml, d_hat_smoother, main="XGBoost vs Smoother", xlab="XGBoost", ylab="Smoother", pch=19, col="blue")
+abline(a = 0, b = 1, col = "red")
+
+```
+```{r}
+y_hat_smoother[1:10]
+```
+
+```{r}
+y_hat_dml[1:10]
+```
+
+```{r}
+dml_plr_obj$smpls[[1]]
+```
+
+```{r}
+predictions_list[2]
+```
+
+
+```{r}
+print(model$feature_names)
+```
+
+```{r}
+print(colnames(dtest))
+```
+
+```{r}
+learners <- dml_plr_obj$models$ml_l$d[[1]]
+for (i in seq_along(learners)) {
+  learner <- learners[[i]]$model
+  print(learner)
+}
+```
+
+```{r}
+dml_plr_obj$
+```
+
+```{r}
+
+length_y = length(obj_dml_data$data$y)
+print(length_y)
+```
+
